@@ -1,0 +1,20 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+*.dylib
+
+# Virtual environments and env files
+venv/
+.venv/
+.env
+.env.*
+
+# Editors/OS
+.vscode/
+.DS_Store
+Thumbs.db
+
+# App artifacts
+vectorstore/
