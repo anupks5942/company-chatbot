@@ -2,7 +2,7 @@ import os
 import glob
 import pandas as pd
 from langchain_community.vectorstores import FAISS 
-from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.document_loaders import TextLoader, PyPDFLoader
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_ollama import OllamaEmbeddings, OllamaLLM
@@ -15,7 +15,7 @@ MODEL_NAME = "llama3.2:3b"
 DATA_PATH = "./data"
 DB_FAISS_PATH = "vectorstore/db_faiss"
 
-print(f"Starting CloudNexus ChatBot (Fixed Version)...")
+print(f"Starting CloudNexus ChatBot (Production Version)...")
 
 # 1. Load Data (Hybrid Approach)
 documents = []
@@ -24,45 +24,49 @@ if not os.path.exists(DATA_PATH):
     print(f"Error: The folder '{DATA_PATH}' does not exist.")
     exit()
 
-# A. Load PDFs (Company Policy/Info)
-pdf_files = glob.glob(os.path.join(DATA_PATH, "*.pdf"))
-for pdf_file in pdf_files:
-    print(f"Loading PDF: {os.path.basename(pdf_file)}")
-    try:
-        loader = PyPDFLoader(pdf_file)
-        docs = loader.load()
-        for doc in docs:
-            doc.metadata['source'] = 'policy_doc'
-            doc.metadata['priority'] = 'low'
-            doc.metadata['filename'] = os.path.basename(pdf_file)
-        documents.extend(docs)
-    except Exception as e:
-        print(f"Error loading PDF {pdf_file}: {e}")
+# A. Load Markdown/PDF (Company Profile)
+# We handle both .md and .pdf for flexibility
+files = glob.glob(os.path.join(DATA_PATH, "*.*"))
+for file_path in files:
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext in ['.md', '.txt', '.pdf']:
+        print(f"Loading Company Doc: {os.path.basename(file_path)}")
+        try:
+            if ext == '.pdf':
+                loader = PyPDFLoader(file_path)
+            else:
+                loader = TextLoader(file_path, encoding='utf-8')
+            
+            docs = loader.load()
+            for doc in docs:
+                doc.metadata['source'] = 'policy_doc' # Tag as Policy
+                doc.metadata['priority'] = 'low'
+                doc.metadata['filename'] = os.path.basename(file_path)
+            documents.extend(docs)
+        except Exception as e:
+            print(f"Error loading {file_path}: {e}")
 
-# B. Load CSV (Employee Data) - Robust Loading
+# B. Load CSV (Employee Data)
 csv_files = glob.glob(os.path.join(DATA_PATH, "*.csv"))
 for csv_file in csv_files:
     print(f"Loading CSV: {os.path.basename(csv_file)}")
     try:
-        # 'skipinitialspace' fixes spacing issues in CSVs
         df = pd.read_csv(csv_file, skipinitialspace=True)
-        
-        # CRITICAL FIX: Clean column names (remove hidden spaces)
+        # Clean columns and data
+        df = df.loc[:, ~df.columns.str.contains('^Unnamed')]
         df.columns = df.columns.str.strip()
-        
-        # Debug: Print columns to verify correct loading
-        print(f"   -> Columns found: {list(df.columns)}")
+        df = df.fillna("Unassigned")
+
+        print(f"   -> Columns cleaned: {list(df.columns)}")
 
         for _, row in df.iterrows():
-            # Robust .get() calls with stripped keys
             name = str(row.get('employee_name', 'Unknown')).strip()
+            if name.lower() in ['nan', 'unknown', '', 'unassigned']: continue
+
             role = str(row.get('designation', 'Unknown')).strip()
             dept = str(row.get('department', 'Unknown')).strip()
-            team = str(row.get('team_name', 'Unknown')).strip()
-            lead = str(row.get('team_lead', 'Unknown')).strip()
-            
-            # Skip empty rows if any
-            if name.lower() in ['nan', 'unknown', '']: continue
+            team = str(row.get('team_name', 'Unassigned')).strip()
+            lead = str(row.get('team_lead', 'Unassigned')).strip()
 
             content = (
                 f"[SOURCE: EMPLOYEE_DB] Employee Record:\n"
@@ -95,26 +99,24 @@ texts = text_splitter.split_documents(documents)
 print("Building Index...")
 embeddings = OllamaEmbeddings(model=MODEL_NAME)
 db = FAISS.from_documents(texts, embeddings)
-db.save_local(DB_FAISS_PATH)
-print("Index Saved!")
-
-# INCREASED k to 15 to ensure we fetch enough candidates from both PDF and CSV
-retriever = db.as_retriever(search_kwargs={"k": 15})
+# CRITICAL FIX: Fetch top 60 documents to avoid 'crowding out' by employees
+retriever = db.as_retriever(search_kwargs={"k": 60}) 
+print("Index Ready!")
 
 # 4. Create Chain
 llm = OllamaLLM(model=MODEL_NAME)
 
 prompt = ChatPromptTemplate.from_template("""
 You are the internal AI assistant for CloudNexus.
-Use the provided context to answer the user's question.
+Use the provided context to answer the user's questions.
 
 CRITICAL RULES:
 1. **Source of Truth**: 
-   - Information marked '[SOURCE: EMPLOYEE_DB]' is the absolute truth for employee details.
-   - Information from PDFs (Company Profile) is the truth for Directors, CEO, and Company Policies.
-2. **Conflict**: If PDF and CSV conflict regarding an *employee*, trust the CSV.
-3. **Completeness**: Check ALL context chunks. If the answer is in the PDF (like Directors), use it.
-4. **Directness**: Answer concisely.
+   - '[SOURCE: EMPLOYEE_DB]' is the truth for employee details.
+   - Markdown/PDF is the truth for Company Info (CEO, Directors, Links).
+2. **Conflict**: If sources conflict, trust the Employee DB for people, and Markdown for policy.
+3. **Completeness**: Use all provided context. If the answer is in the text, say it.
+4. **Format**: Answer concisely.
 
 <context>
 {context}
@@ -124,39 +126,67 @@ Question: {input}
 """)
 
 def format_docs(docs):
-    return "\n\n".join(doc.page_content for doc in docs)
+    unique_docs = {}
+    for doc in docs:
+        if doc.page_content not in unique_docs:
+            unique_docs[doc.page_content] = doc
+    return "\n\n".join(doc.page_content for doc in unique_docs.values())
 
 def get_response(x):
-    # A. Fetch docs
-    all_docs = retriever.invoke(x["input"])
+    query_text = x["input"]
+    all_docs = []
+
+    # 1. Retrieve
+    if query_text.count('?') > 1:
+        print("   [Log] Compound Query Detected. Splitting retrieval...")
+        sub_queries = [q.strip() for q in query_text.split('?') if q.strip()]
+        for sub_q in sub_queries:
+            docs = retriever.invoke(sub_q)
+            all_docs.extend(docs[:15]) # Fetch top 15 for each sub-query
+    else:
+        all_docs = retriever.invoke(query_text)
     
-    # B. Keyword Re-Ranking (FIXED: Removed the massive +5 bias)
-    query_terms = x["input"].lower().split()
+    # 2. Advanced Re-Ranking
+    query_terms = query_text.lower().split()
     scored_docs = []
     
     for doc in all_docs:
         content = doc.page_content.lower()
         score = 0
         
-        # 1. Exact Name Match Bonus (High precision)
-        # If a query term matches a name exactly in the DB, boost it.
-        # This helps "Anup" float to the top if mentioned.
-        if "" in content:
-            for term in query_terms:
-                if term in content: 
-                    score += 3  # Boost relevant employee records
-        
-        # 2. General Context Match
+        # A. Boost Company Info (Docs) if query asks for non-employee stuff
+        is_employee_record = "" in content
+        if not is_employee_record:
+            # If doc is NOT an employee record, give it a base survival score
+            score += 2
+            # Huge boost if query asks for leadership/company info
+            if any(k in query_text.lower() for k in ['ceo', 'cto', 'director', 'policy', 'link', 'url', 'service', 'focus']):
+                score += 10
+
+        # B. Boost Employee Records ONLY if specific name matches
+        if is_employee_record:
+            # Extract the actual name from the record "Name: Aryan"
+            try:
+                # Find the line starting with "Name:"
+                name_line = [line for line in content.split('\n') if 'name:' in line][0]
+                record_name = name_line.split(':')[1].strip().lower()
+                
+                # Check if this specific name is in the user's query
+                if record_name in query_text.lower():
+                     score += 15 # Massive boost for exact person match
+            except:
+                pass
+
+        # C. General Keyword Match
         score += sum(1 for term in query_terms if term in content)
-        
         scored_docs.append((doc, score))
     
-    # Sort and take Top 8 (Increased context window slightly)
+    # Sort and take Top 15 (Context window is large enough for this)
     scored_docs.sort(key=lambda item: item[1], reverse=True)
-    top_docs = [doc for doc, score in scored_docs[:8]]
+    top_docs = [doc for doc, score in scored_docs[:15]]
     
     context_str = format_docs(top_docs)
-    answer = (prompt | llm | StrOutputParser()).invoke({"context": context_str, "input": x["input"]})
+    answer = (prompt | llm | StrOutputParser()).invoke({"context": context_str, "input": query_text})
     
     return {"answer": answer, "context": top_docs}
 
@@ -171,12 +201,3 @@ while True:
     
     response = rag_chain.invoke({"input": query})
     print(f"Bot: {response['answer']}")
-    
-    print("\n[Sources Used]:")
-    seen_sources = set()
-    for doc in response['context']:
-        # Show filename AND source type to be sure
-        src = f"{doc.metadata.get('filename')} ({doc.metadata.get('source', 'Unknown')})"
-        if src not in seen_sources:
-            print(f" - {src}")
-            seen_sources.add(src)
